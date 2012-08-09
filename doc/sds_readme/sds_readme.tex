@@ -1,0 +1,301 @@
+%        File: sds_readme.tex
+%     Created: Thu Jun 07 08:00 PM 2012 C
+% Last Change: Thu Jun 07 08:00 PM 2012 C
+%
+\documentclass[a4paper]{article}
+\usepackage{graphicx}
+\usepackage{indentfirst}
+\usepackage{algorithm}
+\usepackage{xcolor}
+\usepackage{listings}
+
+\definecolor{dkgreen}{rgb}{0,0.6,0}
+\definecolor{gray}{rgb}{0.5,0.5,0.5}
+\definecolor{mauve}{rgb}{0.58,0,0.82}
+
+\lstset{ %
+  basicstyle=\footnotesize,           % the size of the fonts that are used for the code
+  numbers=none,                   % where to put the line-numbers
+  numberstyle=\footnotesize,          % the size of the fonts that are used for the line-numbers
+  stepnumber=2,                   % the step between two line-numbers. If it's 1, each line
+                                  % will be numbered
+  numbersep=5pt,                  % how far the line-numbers are from the code
+  backgroundcolor=\color{white},      % choose the background color. You must add \usepackage{color}
+  showspaces=false,               % show spaces adding particular underscores
+  showstringspaces=false,         % underline spaces within strings
+  showtabs=false,                 % show tabs within strings adding particular underscores
+  frame=none,                   % adds a frame around the code
+  tabsize=2,                      % sets default tabsize to 2 spaces
+  captionpos=b,                   % sets the caption-position to bottom
+  breaklines=true,                % sets automatic line breaking
+  breakatwhitespace=false,        % sets if automatic breaks should only happen at whitespace
+  title=\lstname,                   % show the filename of files included with \lstinputlisting;
+                                  % also try caption instead of title
+  numberstyle=\tiny\color{gray},        % line number style
+  keywordstyle=\color{blue},          % keyword style
+  commentstyle=\color{dkgreen},       % comment style
+  stringstyle=\color{mauve},         % string literal style
+  escapeinside={\%*}{*)},            % if you want to add a comment within your code
+  morekeywords={*,...}               % if you want to add more keywords to the set
+}
+
+
+\begin{document}
+
+\title{Ucore on PIA User Guide}
+\author{Chen Yuheng \\ Tsinghua Unv. \and Yang Yang\\ Tsinghua Unv.}
+\maketitle
+
+\section{Introduction}
+\emph{Ucore} is an experimental operating system that is used in OS course in Tsinghua. Instead of communicating with PC through serial port, Ucore on PIA utilizes a new interface, called \emph{SD Slave (SDS)}, to provide Input/Output service between the card and your PC. Although you
+can still enable UART (the serial port), some advanced features, including file transmitting and KGDB debugging, are SDS specific.
+
+This document will only give practical instructions on our system. If you want to know more about how this system works, please see our other documents.
+
+\section{Development Environment}
+In order to use the SDS, you must make sure that there is a native SD/MMC reader on your PC (converter is not supported), for example:
+
+\begin{verbatim}
+$ lspci -vv | grep sd
+    kernel driver in use: sdhci-pci
+\end{verbatim}
+
+We have tested our usermode SDS host controller \emph{um\_sds} in the following OS:
+
+\begin{itemize}
+\item 32-bit Ubuntu 10.04 LTS, Linux 2.6
+\item 64-bit Gentoo, Linux 3.2 and 3.4
+\end{itemize}
+
+We also develop a kernel mode driver but is not recommended. Contact us
+if you need it.
+
+Other tools you need:
+\begin{itemize}
+\item Minicom: available in most Linux distributions.
+\item ARM9 Toolchain: needed if you want to recompile ucore.
+\end{itemize}
+
+\section{Booting}
+NOTE: The shipped PIA board contains a precompiled bootloader and a 
+ucore kernel, and can boot directly! Please skip to Section \ref{sec:checkconn}.
+\subsection{Prepare An SD Card}
+
+On the PIA development board, you will need a normal SD card to store
+the bootloader(BOOT.BIN) and the kernel(image.bin).
+Since the SD card will be formatted, backup your data first.
+
+To figure out the device name of your SD card:
+\begin{verbatim}
+root@ubuntu:/home/chenyh# fdisk -l
+Disk /dev/mmcblk0: 3904 MB, 3904897024 bytes
+100 heads, 35 sectors/track, 2179 cylinders
+Units = cylinders of 3500 * 512 = 1792000 bytes
+Sector size (logical/physical): 512 bytes / 512 bytes
+I/O size (minimum/optimal): 512 bytes / 512 bytes
+Disk identifier: 0x00000000
+
+        Device Boot      Start         End      Blocks   Id  System
+/dev/mmcblk0p1               3        2180     3809280    b  W95 FAT32
+\end{verbatim}
+
+Make partitions:
+\begin{verbatim}
+root@ubuntu:/home/chenyh# fdisk /dev/mmcblk0
+//create two partitions
+        Device Boot      Start         End      Blocks   Id  System
+/dev/mmcblk0p1               1         294      514482+   6  FAT16
+/dev/mmcblk0p2             295        2179     3298750   83  Linux
+\end{verbatim}
+
+Format partitions:
+\begin{verbatim}
+root@ubuntu:/home/chenyh# mkfs.vfat -n "PIA_boot" /dev/mmcblk0p1
+root@ubuntu:/home/chenyh# mkfs.ext2 -L "PIA_root" /dev/mmcblk0p2
+\end{verbatim}
+
+\subsection{Copy the Binaries to Your SD Card}
+It is recommended to try the precompiled bootloader and kernel before
+you make any changes.
+
+For example:
+\begin{verbatim}
+$ cp bin/pia_boot/* /media/PIA_boot/
+\end{verbatim}
+
+If you compile your own ucore, copy \emph{\$(UCORE\_ROOT)/obj/kernel-initrd-at91}
+to the \emph{PIA\_boot} partition, and rename to \emph{image.bin}.
+
+\subsection{Check the Connection}
+\label{sec:checkconn}
+Now insert your PIA and check the connection:
+\begin{enumerate}
+  \item Power up PIA, wait for 5 seconds (SDS initializing)
+  \item Insert PIA into the SD slot on your PC
+  \item Check your connection:
+    \begin{verbatim}
+$ dmesg|tail
+[ 1835.325238] mmc0: new SDHC card at address 0000
+[ 1835.325457] mmcblk0: mmc0:0000 SDS0 3.69 GiB 
+[ 1835.330193]  mmcblk0:
+
+$ ls /dev/mmc*
+/dev/mmcblk0
+    \end{verbatim}
+
+\end{enumerate}
+
+\section{Console Input/Output}
+
+\subsection{Start the Usermode SDS Daemon}
+
+\begin{verbatim}
+chenyh@ubuntu:~/os/driver/demo$ sudo ./um_sds 
+[sudo] password for chenyh: 
+Waiting SDS...
+listening @ unix socket: sds.socket...
+file >>KGDB listening at PORT 1234
+kgdb_wait_target_break: Waiting target...
+>>
+\end{verbatim}
+
+If you can not see these lines, try to reset the PIA and 
+check the SD connection. 
+
+\subsection{Use Minicom to Communicate with PIA}
+Now, you can use Minicom to access your console on PIA:
+\begin{verbatim}
+chenyh@ubuntu:~/os/driver/demo$ minicom -D unix#`pwd`/sds.socket
+\end{verbatim}
+
+Now you should be able to get a remote shell:
+\begin{verbatim}
+cpu_idle: starting
+kernel_execve: pid = 2, name = "sh".
+Welcome to sh!
+$                                   
+\end{verbatim}
+
+%\subsection{Enable UART}
+%By default, Ucore only uses SDS as its I/O device. If you need
+%to enable UART, you have to change the source code of ucore's kernel:
+
+%\begin{verbatim}
+%TODO
+%\end{verbatim}
+
+%And recompile your kernel\footnote{To figure out how to compile
+%ucore, see \emph{UCore Porting on ARM9}}.
+
+%After connect the PIA with your PC through a serial cable, 
+%reconfigure your Minicom:
+
+%\begin{verbatim}
+%TODO
+%\end{verbatim}
+
+\section{File Uploading}
+Only available in \emph{um\_sds}. The sent file is only stored
+in the memory on PIA, you will need two steps to write it to
+Ucore's filesystem:
+\begin{enumerate}
+\item Ensure that you have start the usermode SDS daemon.
+\item In SDS daemon, use put command to upload a file to the PIA.
+\begin{verbatim}
+file >>put test.exe
+maigc:0x48594853
+file name:test.exe
+finish:100%
+send finish
+file >>
+\end{verbatim}
+
+
+\item On PIA, you should use kshm\_test to get the file from memory to your filesystem. If you use ls, then you will find out test.exe is in current directory now.
+\begin{verbatim}
+$ kshm_test
+[0]: 48594853
+Filename: test.exe
+Filesize: 101133
+$ ls 
+ @ is  [directory] 6(hlinks) 6(blocks) 2048(bytes) : @'.'
+   [d]   6(h)        6(b)     2048(s)   .
+   [d]   6(h)        6(b)     2048(s)   ..
+   [d]   2(h)        3(b)     1280(s)   script
+   [d]   3(h)        2(b)     1024(s)   testman
+   [-]   1(h)        1(b)        6(s)   hello.txt
+   [d]   2(h)       47(b)    12544(s)   bin
+   [d]   2(h)        1(b)      768(s)   test
+   [-]   1(h)       25(b)   101133(s)   test.exe
+
+\end{verbatim}
+
+\item Now you can execute the uploaded file as following.
+\begin{verbatim}
+$ ./test.exe
+Hello world!!.
+I am process 10.
+ARG: 1:
+ARG 0: ./test.exe
+hello pass.
+\end{verbatim}
+\end{enumerate}
+
+\section{KGDB Debugging}
+Only available in \emph{um\_sds}. 
+
+\begin{enumerate}
+\item Ensure that you have start the usermode sds daemon.
+
+Note: To start the usermode sds daemon, you should be in root or use sudo.
+\begin{verbatim}
+gerainty demo # ./um_sds 
+Waiting SDS...
+listening @ unix socket: sds.socket...
+file >>KGDB listening at PORT 1234
+kgdb_wait_target_break: Waiting target...
+\end{verbatim}
+
+\item Get into the debug mode on PIA.
+
+
+\begin{verbatim}
+$ !debug
+\end{verbatim}
+
+\item Open your gdb as following.
+
+{
+\footnotesize
+\begin{verbatim}
+$  arm-linux-gdb
+GNU gdb 6.6
+Copyright (C) 2006 Free Software Foundation, Inc.
+GDB is free software, covered by the GNU General Public License, and you are
+welcome to change it and/or distribute copies of it under certain conditions.
+Type "show copying" to see the conditions.
+There is absolutely no warranty for GDB.  Type "show warranty" for details.
+This GDB was configured as "--host=x86_64-unknown-linux-gnu --target=arm-linux".
+(gdb) 
+\end{verbatim}
+
+}
+\item Load the binary for debug and connect to usermode sds daemon.
+
+\begin{verbatim}
+(gdb) file kernel-initrd-at91
+(gdb) target remote 127.0.0.1:1234
+\end{verbatim}
+
+\item You can begin your debug now.
+
+\end{enumerate}
+
+\section{Problems?}
+Please contact us: \\
+Chen Yuheng: chyh1990@163.com\\
+Yang Yang: geraint0923@gmail.com
+
+\end{document}
+
+
