@@ -156,7 +156,7 @@ Region)的缩写，每一个CPU中都有一个KPCR结构，其中有一个域KPR
 Processor Control
 Block)结构，这两个结构用来保存与线程切换相关的全局信息。KPCR是一个很大的数据结构，其中跟我们实际需求相关的比较重要的是KdVersionBlock指针，它指向了一个DBGKD\_GET\_VERSION64结构，这个结构中包含了PsLoadedModuleList信息，它是Windows加载的所有内核模块构成的链表的表头。还包括了内核加载地址、版本之类的重要信息。这个对用户模式下的模块追踪暂时看来没有很大的用处。
 
-![struct KPCR](pluginv0.2.files/image002.jpg)
+![struct KPCR](pluginv0.2.files/image002.jpg?raw=ture)
 
 ![struct DBGKD_GET_VERSION64](pluginv0.2.files/image003.png)
 
