@@ -1,374 +1,1481 @@
-1.3                  WindowsMonitor插件
----------------------------------------
-
-### 1.3.1 初识WindowsMonitor插件
-
-WindowsMonitor插件实现了对模块和进程加载和卸载的监视，其他插件将它称为Interceptor。这个插件捕获特定内核函数的调用来监视这些事件。目前仅支持Windows
-XP SP2和SP3。
-
-### 1.3.2  WindowsMonitor插件的使用
-
-配置文件：
-
-   pluginsConfig.WindowsMonitor = {  
-		--指明需要监视的操作系统版本
-		version="XPSP3",
-		--指明是否追踪用户模式下的事件，如DLL加载或卸载
-		userMode=true,
-		--指明是否追踪内核模式下的事件，如驱动的加载或卸载
-		kernelMode=true,
-		--以下三个选项都是为调试设置的，一般都设置为true
-		monitorModuleLoad=true,
-		monitorModuleUnload=true,
-		monitorProcessUnload=true,
-		--需要监视的模块列表
-		modules={
-			module_id1={
-				...
-			}
-			module_id2={
-				...
-			}
-		}
-	}
-
-WindowsMonitor 插件不需要依赖其他插件。
-
-### 1.3.3  WindowsMonitor插件的分析
-
-1.3.3.1    WindowsMonitor 插件的初始化
-
-WindowsMonitor 插件首先初始化，做了如下几项工作：
-
-1.读取配置文件中的参数；
-
-2.获取系统基本相关信息，如内核起始地址、检查版本信息等；
-
-3.创建两个Interceptor对象，一个是用户模式下的，一个是内核模式下的，用于处理不同模式下的模块或者驱动的加载或者卸载；
-
-4.连接CorePlugin发出的信号：onTranslateInstructionStart信号和onPageDirectoryChange信号，并调用相关处理函数；
-
-5.读取配置文件中的模块列表。[注：这里的模块列表用于内核模式下的一些处理]
-
-在WindowsMonitor.cpp中实现，代码如下：
-
-	void WindowsMonitor::initialize()
-	{
-		//读取配置文件中的内容
-		string Version = s2e()->getConfig()->getString(getConfigKey() + ".version");
-		m_UserMode = s2e()->getConfig()->getBool(getConfigKey() + ".userMode");
-		m_KernelMode = s2e()->getConfig()->getBool(getConfigKey() + ".kernelMode");
-
-		//For debug purposes
-		m_MonitorModuleLoad = s2e()->getConfig()->getBool(getConfigKey() + ".monitorModuleLoad");
-		m_MonitorModuleUnload = s2e()->getConfig()->getBool(getConfigKey() + ".monitorModuleUnload");
-		m_MonitorProcessUnload = s2e()->getConfig()->getBool(getConfigKey() + ".monitorProcessUnload");
-		m_monitorThreads = s2e()->getConfig()->getBool(getConfigKey() + ".monitorThreads", true);
-
-		//读取内核起始地址，返回固定值0x80000000
-		m_KernelBase = GetKernelStart();
-		//标志是否是第一次调用插件的相关函数
-		m_FirstTime = true;
-		//XXX: do it only when resuming a snapshot.
-		//具体作用有待进一步分析
-		m_TrackPidSet = true;
-
-		unsigned i;
-		for (i=0; i<(unsigned)MAXVER; ++i) {
-			if (Version == s_windowsKeys[i]) {
-				m_Version = (EWinVer)i;
-				break;
-			}
-		}
-
-		if (i == (EWinVer)MAXVER) {
-			s2e()->getWarningsStream() << "Invalid windows version: " << Version << std::endl;
-			s2e()->getWarningsStream() << "Available versions are:" << std::endl;
-			for (unsigned j=0; j<MAXVER; ++j) {
-				s2e()->getWarningsStream() << s_windowsKeys[j] << ":\t" << s_windowsStrings[j] << std::endl;
-			}
-			exit(-1);
-		}
-
-		switch(m_Version) {
-			case XPSP2_CHK:
-			case XPSP3_CHK:
-			s2e()->getWarningsStream() << "You specified a checked build of Windows XP." <<
-			"Only kernel-mode interceptors are supported for now." << std::endl;
-			break;
-			default:
-			break;
-		}
-
-		//XXX: Warn about some unsupported features
-		if (m_Version != XPSP3 && m_monitorThreads) {
-			s2e()->getWarningsStream() << "WindowsMonitor does not support threads for the chosen OS version.\n"
-			<< "Please use monitorThreads=false in the configuration file\n"
-			<< "Plugins that depend on this feature will not work.\n";
-		}
-
-		m_pKPCRAddr = 0;
-		m_pKPRCBAddr = 0;
-
-		m_UserModeInterceptor = NULL;
-		m_KernelModeInterceptor = NULL;
-
-		if (m_UserMode) {
-			//定义一个用户模式的Interceptor对象
-			m_UserModeInterceptor = new WindowsUmInterceptor(this);
-		}
-
-		if (m_KernelMode) {
-			//定义一个内核模式的Interceptor对象
-			m_KernelModeInterceptor = new WindowsKmInterceptor(this);
-		}
-
-		//在翻译每条指令之前，CorePlugin插件都会发送onTranlateInstructionStart信号，S2E会进行相应的处理
-		s2e()->getCorePlugin()->onTranslateInstructionStart.connect(
-		sigc::mem_fun(*this, &WindowsMonitor::slotTranslateInstructionStart));
-
-		s2e()->getCorePlugin()->onPageDirectoryChange.connect(
-		sigc::mem_fun(*this, &WindowsMonitor::onPageDirectoryChange));
-
-		//读取配置文件中的模块列表
-		readModuleCfg();
-	}
-
-1.3.3.2        对onTranslateInstructionStart信号的处理
-
-S2E中的qemu在翻译每条指令之前，都会让CorePlugin插件发送onTranslateInstructionStart信号，WindowsMonitor插件连接onTranslateInstructionStart信号之后调用
-slotTranslateInstructionStart函数进行相应的处理。
-slotTranslateInstructionStart函数根据用户模式和内核模式，主要做了以下两方面的工作：
-
-1.如果是用户模式：
-
-如果是第一次调用此函数，则计算CPU相关数据结构的信息(这里主要获取KPCR结构)；并且通过读取进程的PEB结构枚举进程所加载的所有模块。
-
-	InitializeAddresses(state);                         //计算CPU相关数据结构的信息[a]
-	m_UserModeInterceptor->GetPids(state, m_PidSet);  //m_PidSet中存放的是当前进程的页目录表，在处理onPageDirectoryChange信号时会用到
-	m_UserModeInterceptor->CatchModuleLoad(state);                  //列举进程所加载的模块，并且发送onModuleLoad信号
-	m_PidSet.erase(state->getPid());
-
-说明：
-
- [a] KPCR是处理器控制区(Processor Control
-Region)的缩写，每一个CPU中都有一个KPCR结构，其中有一个域KPRCB(Kernel
-Processor Control
-Block)结构，这两个结构用来保存与线程切换相关的全局信息。KPCR是一个很大的数据结构，其中跟我们实际需求相关的比较重要的是KdVersionBlock指针，它指向了一个DBGKD\_GET\_VERSION64结构，这个结构中包含了PsLoadedModuleList信息，它是Windows加载的所有内核模块构成的链表的表头。还包括了内核加载地址、版本之类的重要信息。这个对用户模式下的模块追踪暂时看来没有很大的用处。
-
-![struct KPCR](pluginv0.2.files/image002.jpg?raw=ture)
-
-![struct DBGKD_GET_VERSION64](pluginv0.2.files/image003.png)
-
-如果不是第一次调用此函数，则根据当前状态的pc进行以下处理：
-
-	if (pc == GetLdrpCallInitRoutine() && m_MonitorModuleLoad) {    //[a]
-		signal->connect(sigc::mem_fun(*this, &WindowsMonitor::slotUmCatchModuleLoad));
-	}else if (pc == GetNtTerminateProcessEProcessPoint() && m_MonitorProcessUnload) {    //[b]
-		signal->connect(sigc::mem_fun(*this, &WindowsMonitor::slotUmCatchProcessTermination));
-	}else if (pc == GetDllUnloadPc() && m_MonitorModuleUnload) {    //[c]
-		signal->connect(sigc::mem_fun(*this, &WindowsMonitor::slotUmCatchModuleUnload));
-	}
-
-说明：
-
-[a]根据当前pc判断是否在装载dll。dll的装载和连接是通过ntdll中的一个函数LdrInitializeThunk实现的，这个函数实质上是ntdll.dll的入口函数，所以GetLdrpCallInitRoutine()函数中根据ntdll.dll的loadbase和nativebase计算此函数的地址，从而判断进程是否正在加载dll，并发送onModuleLoad信号。
-
-[b]根据当前pc判断是否是进程结束，并发送onProcessUnload信号。
-
-[c]根据当前pc判断是否是处在模块卸载，并发送onModuleUnload信号。
-
-注：windows中一些相关的地址，如ntdll的加载地址、进程结束地址、模块卸载地址等都是固定的，以上实现都是通过写定windows中相关的地址（定义在WindowsMonitor.cpp中）计算得到的。
-
-2.如果是内核模式(没有仔细看，留白)：
-
-如果是第一次调用，则更新模块列表，通知所有线程模块的加载：
-	slotKmUpdateModuleList(state, pc);
-	notifyLoadForAllThreads(state);如果不是第一次调用，则根据当前状态的pc进行以下处理： 
-
-	if (pc == GetDriverLoadPc()) {   //[a]
-		signal->connect(sigc::mem_fun(*this, &WindowsMonitor::slotKmModuleLoad));
-	}else if (pc == GetDeleteDriverPc()) {   //[b]
-		signal->connect(sigc::mem_fun(*this, &WindowsMonitor::slotKmModuleUnload));
-	}else if (m_monitorThreads && pc == GetKeInitThread()) {    [c]
-		signal->connect(sigc::mem_fun(*this, &WindowsMonitor::slotKmThreadInit));
-	}else if (m_monitorThreads && pc == GetKeTerminateThread()) {    [d]
-		signal->connect(sigc::mem_fun(*this, &WindowsMonitor::slotKmThreadExit));
-	}
-
-说明：
-
-[a]根据当前状态的pc判断是否在加载驱动，并发送onModuleLoad信号；
-
-[b]根据当前状态的pc判断是否卸载驱动，并发送onModuleUnload信号。
-
-[c]根据当前状态的pc判断是否在创建内核线程，并发送onThreadCreate信号；
-
-[d]根据当前状态的pc判断是否结束线程，并发送onThreadExit信号。
-
-1.3.3.3        关于WindowsMonitor插件的onModuleLoad信号
-
-WindowsMonitor?
-扫描当前进程所有加载的模块，每加载一个模块都会发送onModuleLoad信号。WindowsMonitor插件是通过PEB结构枚举进程内所有已经加载的模块，这个功能通过WindowsUmInterceptor::FindModules来实现。基本原理和步骤如下：
-
-1.找到进程的PEB结构。
-
-进程的PEB结构在用户空间，如果当前状态是运行在用户空间，则通过FS:[30h]获取当前进程的PEB结构，如果运行在内核空间，则通过读取当前进程的EPROCESS结构来获取PEB结构。EPROCESS是进程的执行进程体，包含了进程的各种属性，位于系统空间。
-	if (state->getPc() < 0x80000000) {
-		if(!state->readMemoryConcrete(fsBase + 0x18, &Peb, 4)) {//cdboot ask: why read 0x18 first?
-			return false;
-		}
-		//通过fs:[30h]获取当前进程的PEB结构
-		if(!state->readMemoryConcrete(Peb+0x30, &Peb, 4)) {
-			return false;
-		}
-	}else {
-		//We are in kernel mode, do it by reading kernel-mode struc
-		uint32_t curProcess = -1;
-
-		curProcess = m_Os->getCurrentProcess(state);
-		if (!curProcess) {
-			return false;
-		}
-
-		Peb = m_Os->getPeb(state, curProcess);
-	}
-
-2.通过PEB结构找到PEB\_LDR\_DATA结构。
-
-进程的PEB（Process Environment
-Block）结构中存放了进程的信息，每个进程都有自己的PEB信息。WindowsMonitor插件中的定义如下：
-
-	typedef struct _PEB32 {
-		uint8_t Unk1[0x8];
-		uint32_t ImageBaseAddress;
-		uint32_t Ldr; /* PEB_LDR_DATA */
-	} __attribute__((packed))PEB32;
-
-其中Ldr指向PEB\_LDR\_DATA结构。加载的模块列表主要就是从这个数据结构中获得。WindowsMonitor插件中的定义如下：
-
-	typedef struct _PEB_LDR_DATA32
-	{
-		uint32_t Length;
-		uint32_t Initialized;
-		uint32_t SsHandle;
-		LIST_ENTRY32 InLoadOrderModuleList;
-		LIST_ENTRY32 InMemoryOrderModuleList;
-		uint32_t EntryInProgress;
-	}  __attribute__((packed))PEB_LDR_DATA32;
-
-这里有两个模块列表，InLoadOrderModuleList和InMemoryOrderModuleList，分别表示按照加载顺序的模块列表和按照内存顺序的模块列表。WindowsMonitor插件实现的是按照InLoadOrderModuleList来查找模块。
-
-3.根据PEB\_LDR\_DATA获取InLoadOrderModuleList.Flink，开始遍历循环列表，枚举每个加载的模块。
-
-具体实现代码如下(UserModeInterceptor.cpp)：
-
-	//通过进程的PEB结构枚举进程内所有已加载的模块
-	bool WindowsUmInterceptor::FindModules(S2EExecutionState *state)
-	{
-		s2e::windows::LDR_DATA_TABLE_ENTRY32 LdrEntry;
-		s2e::windows::PEB_LDR_DATA32 LdrData;
-
-		if (!WaitForProcessInit(state)) {
-			return false;
-		}
-
-		//读取PEB_LDR_DATA的内容，m_LdrAddr是由WaitForProcessInit得来的
-		if (!state->readMemoryConcrete(m_LdrAddr, &LdrData, sizeof(s2e::windows::PEB_LDR_DATA32))) {
-			return false;
-		}
-
-		//计算LDR_DATA_TABLE_ENTRY真正的起始地址
-		uint32_t CurLib = CONTAINING_RECORD32(LdrData.InLoadOrderModuleList.Flink,
-		s2e::windows::LDR_DATA_TABLE_ENTRY32, InLoadOrderLinks);
-
-		uint32_t HeadOffset = m_LdrAddr + offsetof(s2e::windows::PEB_LDR_DATA32, InLoadOrderModuleList);
-		if (LdrData.InLoadOrderModuleList.Flink == HeadOffset) {
-			return false;
-		}
-
-		//枚举所有已经加载的dll
-		do {
-			if (!state->readMemoryConcrete(CurLib, &LdrEntry, sizeof(s2e::windows::LDR_DATA_TABLE_ENTRY32))) {
-				return false;
-			}
-
-			std::string s;
-			state->readUnicodeString(LdrEntry.BaseDllName.Buffer, s, LdrEntry.BaseDllName.Length);
-			std::transform(s.begin(), s.end(), s.begin(), ::tolower);
-
-			if (s.length() == 0) {
-				if (LdrEntry.DllBase == 0x7c900000) {
-					//XXX
-					//ntdll.dll总是被加载在固定的地址
-					s = "ntdll.dll";
-				}else {
-					s = "<unnamed>";
-				}
-			}
-
-			//if (m_SearchedModules.find(s) != m_SearchedModules.end()) {
-			//Update the information about the library
-			ModuleDescriptor Desc;
-			Desc.Pid = state->getPid();
-			Desc.Name = s;PEB结构枚举进程内所有已加载的模块
-			Desc.LoadBase = LdrEntry.DllBase;
-			Desc.Size = LdrEntry.SizeOfImage;
-
-			//XXX: this must be state-local
-			if (m_LoadedLibraries.find(Desc) == m_LoadedLibraries.end()) {
-				m_LoadedLibraries.insert(Desc);
-				NotifyModuleLoad(state, Desc);
-			}
-
-			CurLib = CONTAINING_RECORD32(LdrEntry.InLoadOrderLinks.Flink,
-			s2e::windows::LDR_DATA_TABLE_ENTRY32, InLoadOrderLinks);
-		}while(LdrEntry.InLoadOrderLinks.Flink != HeadOffset);
-
-		return true;
-	}
-
-通过以上三个步骤，可以枚举所有模块，每一个模块都由一个ModuleDescriptor类型来描述模块属性，如模块名称、加载地址、镜像大小等。每遇到一个模块，加入到集合中去，并且调用NotifyModuleLoad函数来发送onModuleLoad信号。
-
-2.3                  总体插件
+2.1????????????????? 栈的检查
 -----------------------------
 
-### 2.3.1 插件作用
+为了检查在memcpy函数中是否存在缓冲区溢出，开发VulMining插件用来对输入数据符号化和断言，调用StackMoniotr插件和StackChecker插件的相关函数，完成对memcpy函数的检查。
 
-该插件用于将输入数据符号化，并在进行不安全操作（如拷贝、分配内存）时进行相应断言，以检测漏洞。该插件可以适用于整数溢出插件和缓冲区溢出插件。
+### 2.1.1 总体思路
 
-### 2.3.2 整体思路
+1、调用StackMonitor插件得到进程的栈空间以及各个栈针。（进程相关）
 
-该插件对每一条指令进行监控，进行如下操作：
+?
 
-1.当运行到接收输入数据的函数时（如ReadFile、recv函数），对读入的缓冲区进行符号化，将缓冲区的每一个字节都标记为符号变量；
+2、定位memcpy函数。(两种编译方式：内联和库调用)
 
-2.当运行到不安全操作函数时（如malloc、memcpy函数），对这些函数进行相应的断言，检测漏洞是否存在。
+?
 
-### 2.3.3 输入数据符号化
+3、根据memcpy函数中第一个参数（目的地址指针）调用修改后的StackChecker插件来判断处于栈空间的哪一个栈针中，得到该栈针的大小。
 
-结合静态分析和动态分析，在实际测试之前将接收输入数据函数的第一条指令地址写入文件中（./data\_recv\_functions.txt）。文件中的组织结构如下：
+?
 
-	recvfrom:0x71a22ff7
-	WSARecv:0x71a24cb5
-	recv:0x71a2676f
-	WSARecvFrom:0x71a2f66a
-	ReadFile:0x7c801812
-	RtlAllocateHeap:0x7c9300a4
-	RtlReAllocateHeap:0x7c939b80
+4、结合memcpy断言，对memcpy函数的地三个参数（拷贝缓冲区的大小）来判断是否存在缓冲区溢出漏洞。（符号信息直接传递）????????
 
-在插件初始化时，将其中的函数及其首地址读入定义好的向量中，对向量中的每个地址进行监控。当程序实际运行到这些地址时，根据函数调用时栈中的存储规则，函数相应参数依次压栈，此时的esp寄存器中存放的是函数的返回地址（及call的下一条指令），将返回地址也加入需监视的地址列表中。当程序运行到返回地址时，输入数据刚刚存入缓冲区中，此时将输入数据缓冲区进行符号化。过程示意图如图1.
+### 2.1.2 使用方法
 
-![图1](pluginv0.2.files/image019.jpg)
+需要用到VulMining插件、StackMonitor及StackChecker插件。
 
-### 2.3.4 不安全函数断言
+StackMonitor?
+插件以及StackChecker插件的用法前面已经介绍过。这里对其进行了一些修改。
 
-结合静态分析和动态分析，在实际测试之前将接收输入数据函数的第一条指令地址写入文件中（./unsafe\_functions.txt）。文件中的组织结构如下：
+### 2.1.3 动态得到栈针大小实现方法
 
-	rep movsd:0x0038096b
-	malloc:0x00401ab2
-	_memcpy:0x004037a0
+1、在VulMining插件中定义一个onStackCheck信号，用来在检测到memcpy指令时，通知StackChecker插件查找指针所处栈针，并且得到该栈针的大小。
 
-在插件初始化时，将其中的函数及其首地址读入定义好的向量中，对向量中的每个地址进行监控。当程序实际运行到这些地址时，根据不同检测策略进行相应的断言，检测是否存在漏洞。
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+sigc::signal<void,
+~~~~
 
- 
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+S2EExecutionState *,
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+uint64_t /* virtual address */,
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+uint64_t /* size */,
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+StackFrameInfo * /* stackframe */>
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+onStackCheck;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+?
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+?
+~~~~
+
+2、修改StackChecker插件，不使用MemoryChecker插件的onPostCheck信号，改用VulMining插件中定义的onStackCheck信号。在StackChecker插件初始化时连接AssertExpert插件的onStackCheck信号，完成相应的处理。
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+void StackChecker::initialize()
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+{
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????...
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? m_vulMining->onStackCheck.connect(
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? sigc::mem_fun(*this, &StackChecker::onMemoryAccess));
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+}
+~~~~
+
+3、修改StackChecker插件的onMemoryAccess函数，maxSize参数为address对应栈针的大小，如果address不在栈空间内，或者没有得到address所对应的栈针，则将maxSize设置为固定值0x20。onMemoryAccess函数的声明如下：
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+void StackChecker::onMemoryAccess(S2EExecutionState *state, uint64_t address,
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+uint64_t size, uint64_t *maxSize)
+~~~~
+
+得到maxSize之后，交给memcpy断言，来判断是否存在栈溢出(拷贝长度是否大于栈帧大小)。
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+klee::ref<klee::Expr> cond = klee::SgtExpr::create(symValue, klee::ConstantExpr::create(/*0x20*/maxSize, symValue.get()->getWidth()));
+~~~~
+
+?
+
+2.2????????????????? 堆的检查
+-----------------------------
+
+借鉴栈溢出检测插件的思想，写出HeapMonitor和HeapChecker插件，用来动态得到进程堆内存情况，检测堆溢出。
+
+### 2.2.1 前置知识
+
+堆是一种在程序运行时动态分配的内存，由程序员在使用堆时根据需要用专门的函数，如malloc等，进行动态申请。为了高效的管理堆内存，现代操作系统的堆数据结构一般包括堆块和堆表两类，如图1所示。
+
+![说明:
+http://192.168.5.132/cgi-bin/twiki/viewfile/Main/S2E%e4%b8%ad%e5%a0%86%e7%9a%84%e6%a3%80%e6%9f%a5---%e9%92%88%e5%af%b9memcpy%e5%87%bd%e6%95%b0%e7%9a%84%e6%a3%80%e6%9f%a5?rev=1;filename=%e5%a0%86%e7%9a%84%e5%86%85%e5%ad%98%e7%bb%84%e7%bb%87.png](pluginv0.2.files/image009.jpg)
+
+图1
+
+?
+
+堆块：堆区的内存按照不同大小组织成块，以堆块为单位进行标识。每个堆块包括块首和块身，块首记录了堆块自身信息，例如本块的大小、空闲还是占用等信息；块身紧随其后，也是最终分配给用户使用的数据区。堆块的结构如图2所示。
+
+![说明:
+http://192.168.5.132/cgi-bin/twiki/viewfile/Main/S2E%e4%b8%ad%e5%a0%86%e7%9a%84%e6%a3%80%e6%9f%a5---%e9%92%88%e5%af%b9memcpy%e5%87%bd%e6%95%b0%e7%9a%84%e6%a3%80%e6%9f%a5?rev=1;filename=%e5%a0%86%e5%9d%97%e6%95%b0%e6%8d%ae%e7%bb%93%e6%9e%84.png](pluginv0.2.files/image011.jpg)
+
+图2
+
+?
+
+?
+
+堆表：堆表一般位于堆区的起始位置，用于索引堆区中所有堆块的重要信息。在windows中，占用态的堆块被使用它的程序索引，而堆表只索引所有空闲的堆块。
+
+?
+
+空闲堆块由双向链表组织，按照堆块大小的不同，空表分为128条。如图3所示。空闲堆块的大小=索引项（ID）\*8（字节）。如free[1]标识了堆区中所有大小为8字节的空闲堆块。需要注意的是free[0]相对比较特殊，这条双向列表标识了所有大于等于1024字节的堆块。
+
+?
+
+?
+
+![说明:
+http://192.168.5.132/cgi-bin/twiki/viewfile/Main/S2E%e4%b8%ad%e5%a0%86%e7%9a%84%e6%a3%80%e6%9f%a5---%e9%92%88%e5%af%b9memcpy%e5%87%bd%e6%95%b0%e7%9a%84%e6%a3%80%e6%9f%a5?rev=1;filename=%e7%a9%ba%e9%97%b2%e5%8f%8c%e5%90%91%e9%93%be%e8%a1%a8.png](pluginv0.2.files/image013.jpg)
+
+图3
+
+?
+
+堆管理系统的三类操作：堆快分配、堆块释放、堆块合并归根结底都是堆链表的修改，分配就是将堆块从空表中“卸下”，释放就是把堆块“链入”空表，合并可以看作是把若干个堆块先从空表中“卸下”，修改块首信息，之后把更新后的新块“链入”空表。所有”卸下“和”链入“堆快的工作都发生在链表中，如果能够伪造链表节点的指针，在”卸下“和”链入“的过程中就有可能获得以此读写内存的机会。
+堆溢出原理如图4所示。
+
+![说明:
+http://192.168.5.132/cgi-bin/twiki/viewfile/Main/S2E%e4%b8%ad%e5%a0%86%e7%9a%84%e6%a3%80%e6%9f%a5---%e9%92%88%e5%af%b9memcpy%e5%87%bd%e6%95%b0%e7%9a%84%e6%a3%80%e6%9f%a5?rev=1;filename=%e5%a0%86%e6%ba%a2%e5%87%ba%e5%8e%9f%e7%90%86.png](pluginv0.2.files/image015.jpg)
+
+图4
+
+?
+
+堆溢出利用的精髓就是用精心构造的数据去溢出下一个堆块的块首，改写块首中的前向指针和后向指针，然后在分配、释放、合并等操作发生时伺机获得一次向内存任意地址写入任意数据的机会。
+
+?
+
+由上面的知识，我们检测堆溢出的思路如下：
+
+?
+
+1、对”卸下“操作，即内存分配。对计算出能够以超长字节覆盖的堆块，判断其物理相连的下一个堆块是否是空闲堆块，如果满足既是空闲堆块，又在程序后期运行过程中分配出去，则可能发生可利用的堆溢出。
+
+?
+
+2、对”链入“操作，即内存释放。对计算出能够以超长字节覆盖的堆块，判断其物理相连的下一个堆块是否是占用堆块，如果满足既是占用堆块，又在程序后期运行过程中释放，则可能发生可利用的堆溢出。
+
+?
+
+（暂时没有考虑合并操作）
+
+?
+
+### 2.2.2 整体思路
+
+1、利用HeapMonitor插件得到进程的堆区及各个堆块。（进程相关）
+
+?
+
+2、定位memcpy函数。(两种编译方式：内联和库调用)
+
+?
+
+3、根据memcpy函数中第一个参数（目的地址指针），利用HeapChecker插件找到目的地址处于哪一个堆块，得到该堆块的大小。
+
+?
+
+4、结合memcpy断言，对memcpy函数的地三个参数（拷贝缓冲区的大小）来判断是否存在缓冲区溢出漏洞。（符号信息直接传递）
+
+### 2.2.3 HeapMonitor[?](http://192.168.5.132/cgi-bin/twiki/edit/Main/HeapMonitor?topicparent=Main.S2E中堆的检查---针对memcpy函数的检查 "创建这个主题") 插件设计思路及实现
+
+整体思路:
+
+动态对进程堆区和堆块进行建模。堆区的获得通过PEB结构和HEAP结构获取；堆块的获得通过挂钩RtlAllocateHeap函数获取。
+
+?
+
+2.2.3.1??????? 数据结构
+
+?
+
+堆区描述：
+
+每个进程都有自己独立的若干个堆区，使用如下数据结构记录每个进程的每个堆区：
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+typedef std::map<PidHeapBase , Heap> Heaps;
+~~~~
+
+其中PidHeapBase是std::pair类型，是进程的PID号和每个堆区基址的键值对，定义如下：
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+typedef std::pair<uint64_t , uint64_t> PidHeapBase;
+~~~~
+
+Heap是一个类，记录了一个堆区的信息（主要是堆区基址以及堆区大小），定义了一些方法（主要包括堆块的更新和新堆块的生成），主要定义如下：
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+class Heap {
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? public:
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? uint64_t m_heapBase;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? uint64_t m_heapSize;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????HeapBlocks m_blocks;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????public:
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? //堆的构造函数
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? Heap(S2EExecutionState *state,
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? HeapMonitorState *plgState,
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? uint64_t pc,
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? uint64_t base, uint64_t size) {
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????????????m_heapBase = base;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? m_heapSize = size;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????????????const ModuleDescriptor *module = plgState->m_detector->getModule(state, pc);
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? assert(module && "BUG: HeapMonitor should only track configured modules");
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? }
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????uint64_t getHeapBase() const {
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? return m_heapBase;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? }
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????uint64_t getHeapSize() const {
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? return m_heapSize;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? }
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????/** 遇到RtlAllocateHeap函数时调用此函数，新生成一个堆块 */
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? void newBlock(S2EExecutionState *state, unsigned currentModuleId, uint64_t pc, uint64_t blockAddress , uint32_t size) {
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????????????assert(blockAddress >= m_heapBase && blockAddress < (m_heapBase + m_heapSize));
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????????????HeapBlock block;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? block.moduleId = currentModuleId;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? block.BlockAddress = blockAddress;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? block.BlockSize = size;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? m_blocks.push_back(block);
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? }
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????/*遇到free函数调用此函数，释放掉一个堆块*/
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? void update(S2EExecutionState *state, unsigned currentModuleId, uint64_t blockAddress , uint32_t size) {
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? assert(!m_blocks.empty());
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? assert(blockAddress >= m_heapBase && blockAddress < (m_heapBase + m_heapSize));
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????????????HeapBlock p;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? p.BlockAddress = blockAddress;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? ????????p.BlockSize = size;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? p.moduleId = currentModuleId;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????????????HeapBlocks::iterator it = m_blocks.begin();
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????????????unsigned i = 0;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? while (i < m_blocks.size()) {
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????? if ((m_blocks[i].moduleId == p.moduleId) && (m_blocks[i].BlockAddress == p.BlockAddress) && (m_blocks[i].BlockSize == p.BlockSize)) {
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????????????? m_blocks.erase(it + i);
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????????????? break;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+?? ?????????????????????} else {
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????????????? ++i;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????? }
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? }
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? }
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????bool empty() const {
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? return m_blocks.empty();
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? }
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????bool getBlock(uint64_t blockAddress, bool &blockValid, HeapBlock &blockInfo) const {
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? if (blockAddress < m_heapBase? || (blockAddress >= m_heapBase + m_heapSize)) {
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????? return false;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? }
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????????????blockValid = false;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????????????//Look for the right frame
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? //XXX: Use binary search?
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? foreach2(it, m_blocks.begin(), m_blocks.end()) {
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????? const HeapBlock &block= *it;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????? if (blockAddress != block.BlockAddress) {
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????????????? continue;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????? }
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????????????????????blockValid = true;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????? blockInfo = block;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+?????????? ?????????????break;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? }
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????????????return true;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? }
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????friend std::ostream& operator<<(std::ostream &os, const Heap &stack);
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+};
+~~~~
+
+2.2.3.2??????? 获得堆区的实现
+
+?
+
+堆区基址以及大小的动态获得的过程如图5所示。
+
+?
+
+![说明:
+http://192.168.5.132/cgi-bin/twiki/viewfile/Main/S2E%e4%b8%ad%e5%a0%86%e7%9a%84%e6%a3%80%e6%9f%a5---%e9%92%88%e5%af%b9memcpy%e5%87%bd%e6%95%b0%e7%9a%84%e6%a3%80%e6%9f%a5?rev=1;filename=%e5%a0%86%e5%8c%ba%e5%9f%ba%e5%9d%80%e8%8e%b7%e5%be%97.png](pluginv0.2.files/image017.jpg)
+
+?
+
+图5
+
+?
+
+?
+
+每个进程都有PEB结构，位于TIB结构的0x30偏移处，PEB结构中记录了有关该进程各个堆区的情况。为了得到堆区，定义结构体PEB\_HEAP如下（仅定义了与堆信息相关的字段）：
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+typedef struct _PEB_HEAP {
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? PEB32 peb32;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? uint32_t Unk1[30];? //
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? uint32_t NumberOfHeaps;???????????????????????????? // 88h, 指出当前进程中存在多少个堆区
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? uint32_t MaximumNumberOfHeaps;????????????????????? // 8Ch， 指出当前进程最多可以存在多少个堆区
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? uint32_t ProcessHeaps;??????????????????????????? // 90h， 指向存储当前进程所有堆区句柄（基址）的内存区域
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+}__attribute__((packed))PEB_HEAP;
+~~~~
+
+?
+
+循环读取ProcessHeaps字段指向的各个堆区基址，每个基址都指向一个堆结构，堆结构的定义如下（仅定义了与堆区大小相关的字段）：
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+typedef struct _HEAP32 {
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? uint32_t Unk1[6];
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? uint32_t SegmentReserve;? //堆区保留大小（最大大小）
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? uint32_t SegmentCommit;??????? //堆区提交大小（已经提交大小，可用大小）
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+}__attribute__((packed))HEAP32;
+~~~~
+
+堆区可能会随着程序的运行而扩展大小，通过这个结构可以动态获得每个堆区的大小。
+
+?
+
+获得堆区的具体函数实现如下：
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+void HeapMonitorState::updateHeapArea(S2EExecutionState *state, uint64_t pc)
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+{
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? const ModuleDescriptor *module = m_detector->getModule(state, pc);
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? assert(module && "BUG: unknown module");
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????uint32_t numberOfHeaps = 0;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? uint32_t processHeaps = 0;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? m_monitor->getNumberOfHeaps(state , &numberOfHeaps);????????? //通过PEB_HEAP结构得到某个进程中堆区的个数
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? m_monitor->getProcessHeaps(state , &processHeaps);???????????????? //通过PEB_HEAP结构得到某个进程中的ProcessHeaps结构的地址。
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????for(int i = 0; i < numberOfHeaps ; i++){
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? uint32_t each_heap = 0;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? s2e::windows::HEAP32 Heap32;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????????????state->readMemoryConcrete(processHeaps + i*sizeof(uint32_t), &each_heap, sizeof(uint32_t));????? //读出每个堆区的基址
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? state->readMemoryConcrete(each_heap , &Heap32 , sizeof(Heap32));???????????????????????????????????????????? //读出每个堆区的结构
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????????????uint64_t pid = m_monitor->getPid(state, pc);
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? //如果是不同的堆区
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? if ((pid != m_pid) || !(each_heap >= m_cachedHeapBase && each_heap < (m_cachedHeapBase + m_cachedHeapSize))) {
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????? m_pid = pid;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????????????????????m_cachedHeapBase = each_heap;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????? ??????????????????m_cachedHeapSize = Heap32.SegmentCommit;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? }
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????????????//加入m_heaps向量中
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? PidHeapBase p = std::make_pair(pid, m_cachedHeapBase);
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????????????//加入到m_heaps向量中
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? Heaps::iterator heapit = m_heaps.find(p);
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? if (heapit == m_heaps.end()) {
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????? Heap heap(state, this, pc, m_cachedHeapBase, m_cachedHeapSize);
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????? m_heaps.insert(std::make_pair(p, heap));
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????? heapit = m_heaps.find(p);
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? }
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? }
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+}
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+?
+~~~~
+
+?
+
+?
+
+2.2.3.3??????? 获得堆块的实现
+
+?
+
+堆块的分配函数malloc(), LocalAlloc? (), GlobalAlloc? (), HeapAlloc?
+()等函数最终都是通过ntdll.dll中的RtlAllocateHeap()函数实现的，因此，我们监控这个函数，得到其各个参数，就能得到所申请的每个堆块的基址和大小了。
+
+监控堆快的释放free()函数, 将释放的堆块从向量中删除。
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+void HeapMonitorState::updateHeapBlocks(S2EExecutionState *state, uint64_t pc , bool isFree)
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+{
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? g_s2e->getMessagesStream() << "HeapMonitorState::updateHeapBlocks at pc:" << hexval(pc) << "\n";
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????const ModuleDescriptor *module = m_detector->getModule(state, pc);
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? assert(module && "BUG: unknown module");
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????//EAX寄存器中存放的是申请的堆块的基址
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? uint32_t eax = 0;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? state->readCpuRegisterConcrete(offsetof(CPUState, regs[R_EAX]), &eax, sizeof(eax));
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? g_s2e->getMessagesStream() << "HeapMonitorState::eax :" << hexval(eax) << "\n";
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? if(eax >= 0x80000000){
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? return;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? }
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????uint64_t sp , size , hHeap = 0;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? sp = state->getSp();
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????? ??//ESP-0x4存放的是申请的内存大小
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? state->readMemoryConcrete(sp - 0x4, &size, sizeof(uint32_t));
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? //ESP-0xc存放的是申请的内存在哪个堆句柄中
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? state->readMemoryConcrete(sp - 0xc, &hHeap, sizeof(uint32_t));
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? g_s2e->getMessagesStream() << "HeapMonitorState::hHeap :" << hexval(hHeap) << "\n";
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????uint64_t pid = m_monitor->getPid(state, pc);
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????//added by cdboot 20120910
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? //动态得到当前各个堆区的信息
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? updateHeapArea(state , pc);
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????//得到eax即新申请到的堆块的地址所在的堆区的基址
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+?? ?????uint64_t tmpHeapBase = getHeapBase(state , pid , eax);
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????//查看新申请到的堆块是否
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? PidHeapBase p = std::make_pair(pid, tmpHeapBase);
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? Heaps::iterator heapit = m_heaps.find(p);
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? assert((heapit != m_heaps.end()) && "BUG: not in any heap area!");
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????Heap &heap = (*heapit).second;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????unsigned moduleId = m_moduleCache.getId(*module);
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????if(hHeap != tmpHeapBase){
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? return;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? }
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????if (!isFree) {??? //是申请内存操作，则新建一个堆块
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? heap.newBlock(state, moduleId, pc, eax , size);
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? } else {??????????? //是释放内存操作，则将该堆块从向量中删除
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? //note2：free()函数还没有处理
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? (*heapit).second.update(state, moduleId, eax , size);
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??? ????}
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????if ( m_debugMessages) {
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? g_s2e->getDebugStream() << (*heapit).second << "\n";
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? }
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+}
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+?
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+?
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+?
+~~~~
+
+### 2.2.4 HeapChecker[?](http://192.168.5.132/cgi-bin/twiki/edit/Main/HeapChecker?topicparent=Main.S2E中堆的检查---针对memcpy函数的检查 "创建这个主题") 插件设计思路及实现
+
+整体思路：
+
+?
+
+接收处理不安全函数时（memcpy函数）的信号，根据拷贝的目的地址找到目的地址所在的堆区，判断与其物理相邻的堆区的状态（空闲或占用），之后根据2.2.1中的两种情况分别判断是否会发生堆溢出。
+
+?
+
+现在的版本较为简单，需要改进。
+
+?
+
+检测堆溢出的代码如下：
+
+?
+
+?
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+void HeapChecker::onMemoryAccess(S2EExecutionState *state, uint64_t address,
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+uint64_t size, HeapBlockInfo *info)
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+{
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????uint64_t heapBase = 0, heapSize = 0;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? uint64_t pid = state->getPid();
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????heapBase = m_heapMonitor->getHeapBase(state , pid , address);
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? heapSize = m_heapMonitor->getHeapSize(state , pid , heapBase);
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????//判断是DEBUG版本还是RELEASE版本
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? bool isDebug = m_heapMonitor->isBuild(state , pid);
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????//粗略判断当前地址是否在堆空间内
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? if (!(address >= heapBase && (address < heapBase + heapSize))) {
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? //??????? *maxSize = 0x20;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? //modified by cdboot 20120604
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? info->HeapAreaSize = 0x00000000;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? return;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? }
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????bool onTheHeap = false;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? //查找是否有当前地址所对应的堆区
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? bool res = m_heapMonitor->getBlockInfo(state, address, onTheHeap, *info);
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????//??? *maxSize = 0x20;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????//如果不再堆空间内，返回
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? if (!onTheHeap) {
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????? ??????m_heapMonitor->dump(state);
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? //modified by cdboot 20120604
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? info->BlockSize = 0x00000000;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? return;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? }
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????if (!res) {
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? std::stringstream err;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????????????info->BlockSize = 0x00000000;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? return;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? }
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? else{
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? //??? ???????? *maxSize = info.FrameSize;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? //判断address之后物理相连的地址是否是空闲堆块
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? //modified by cdboot 20120903
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? uint64_t nextAddress = 0;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? uint16_t allocateSize = 0;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? if(!isDebug){
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????? state->readMemoryConcrete(address - 8 , &allocateSize , sizeof(uint16_t));
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????? nextAddress = address - 8 + allocateSize*8;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? }else{
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????? state->readMemoryConcrete(address - 20 , &allocateSize , sizeof(uint8_t));
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????? nextAddress = address - 20 + allocateSize*8;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? }
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????????????uint8_t flag = 0;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????????????if(address >= heapBase && (address < heapBase + heapSize))
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? {
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????? if(!isDebug){
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????????????? state->readMemoryConcrete(nextAddress + 5 , &flag , sizeof(uint8_t));
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????? }else{
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????????????? state->readMemoryConcrete(nextAddress + 5 , &flag , sizeof(uint8_t));
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????? }
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????????????????????bool isBusy = flag & 0x1;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????? if(isBusy){
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????????????? info->BlockSize = 0x00000000;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????????????? return;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????? }
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? }else{
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????? info->BlockSize = 0x00000000;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????????????? return;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? }
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? }
+~~~~
+
+?
+
+其中需要注意的是：release版本和debug版本编译的程序堆块结构稍有不同，所以增加了isBuildDebug()函数来判断，isBuilDebug()函数定义在WindowsMonitor.cpp中，主要是从程序的头部中读取相应字段判断是否是debug版本，代码如下：
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+bool WindowsMonitor::isBuildDebug(S2EExecutionState *s, const ModuleDescriptor &desc)
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+{
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? if (desc.Pid && s->getPid() != desc.Pid) {
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????????????? return false;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? }
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? 
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+????????WindowsImage Img(s, desc.LoadBase);
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? bool result = Img.getDebugFlag() & 0x0100;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+??????? return result;
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+}
+~~~~
+
+~~~~ {style="background:ivory;mso-layout-grid-align:none"}
+?
+~~~~
+
+### 2.2.5 不足和改进
+
+1、堆溢出中的几种情况需要进一步详细完善；
+
+2、间接符号传递的问题暂时还没有解决；
+
+3、插件与操作系统相关，需要在不同操作系统平台之间迁移。
